@@ -1,0 +1,2381 @@
+---
+title: "Desarrollo de un moedelo predictivo para la detección de cáncer de mama"
+author: "Julián Guilló"
+date: "26/1/2022"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+    number_sections: yes
+toc: true
+toc-depth: 10
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+
+Se recomienda cargar el archivo `sesion_completa.RData` con todas las variables, modelos y gráficas del trabajo, para evitar tener que ejecutar todo de nuevo. Puedes descargarlo junto con el código y la memoria en (https://github.com/Julian-Guillo/breast_cancer_diagnosis). 
+
+```{r}
+base::load("sesion_completa.RData") 
+```
+
+Compruebe que tiene instaladas todas las dependencias de este archivo.
+
+```{r}
+# Instala las dependencias de este archivo
+
+# install.packages("renv") # descomentar y ejecutar en caso de no tener 
+## el paquete renv instalado
+require("renv") # manejo de dependencias
+myDependencies <- renv::dependencies("codigo_tfm_julian_guillo.Rmd")
+myDependencies <- unique(myDependencies$Package)
+
+
+requiredPackages <- setdiff(myDependencies, rownames(installed.packages()))
+if (length(requiredPackages) == 0) {
+  print("Todo correcto!")
+} else {
+  print(paste0("Es necesario instalar los siguientes paquetes: ",
+             paste0(requiredPackages, collapse = ", ")))
+}
+
+# install.packages(requiredPackages) # descomentar para instalar dependencias
+```
+
+Cargar todos los paquetes necesarios para correr el código.
+
+```{r}
+# Paquetes utilizados
+library(MASS) # selección de variables mediante métodos stepwise
+# importar primero MASS para evitar enmascaramiento de la función 'select' de dplyr
+library(dplyr) # manipulación de tablas
+library(tidyr) # manipulación de tablas
+library(tibble) # funciones útiles para data.frames
+library(ggplot2); theme_set(theme_light()) # gráficas
+library(GGally) # generar grid de gráficas
+library(ggcorrplot) # matriz de correlación en ggplot2
+library(caret) # validación cruzada y ajuste de hiperparámetros
+# Nota: caret carga los paquetes según sea necesario y asume que están instalados. 
+# Si falta un paquete de modelado, aparece un aviso para instalarlo 
+# para asegurarse de que están instalados todos los paquetes necesarios.
+library(glmnet) # regularización de modelos
+library(class) # modelos de clasificación (knn en este caso)
+library(kknn) # k-vecinos más cercanos
+library(rpart) # árboles de decisión
+library(rpart.plot) # gráficas de árboles de decisión
+library(randomForest) # modelos random forest
+library(gbm) # modelos boosting trees
+library(kernlab) # máquinas de vector soporte
+```
+
+# Análisis exploratorio
+
+```{r}
+data <- read.csv(file = "data.csv") %>%
+  dplyr::select(-X) %>% # eliminar columna vacía 
+  # tomar muestras malignas como referencia para posteriores cálculos de 
+  # sensibilidad y especificidad
+  dplyr::mutate(diagnosis = relevel(as.factor(diagnosis), ref = "M"))
+```
+
+
+## Análisis de la variable respuesta
+
+```{r fig.height=2, fig.width=5}
+# Representamos ambos grupos de la variable respuesta en un gráfico de barras
+responseVariableBarplot <- ggplot(data = data,
+                                  aes(x = diagnosis, fill = diagnosis)) +
+  geom_bar() +
+  scale_fill_manual(name = "diagnóstico", 
+                    labels = c("maligno", "benigno"), 
+                    values = c("#9E67AB" , "#E69F00")) +
+  theme_bw() +
+  scale_x_discrete(breaks = c("M", "B"),
+                   labels = c("maligno", "benigno")) +
+  theme(axis.title.x=element_blank(),
+        axis.title.y = element_blank(),
+        axis.text = element_text(size = rel(1)),
+        legend.position="none") + 
+  coord_flip()
+responseVariableBarplot
+```
+
+```{r}
+# Obtenemos las frecuencias de cada grupo
+sum(data$diagnosis == "M")
+sum(data$diagnosis == "B")
+```
+
+## Gráficos para observar relaciones entre covariables
+
+**Matriz de correlaciones**
+
+```{r fig.height=7, fig.width=7, fig.align='center'}
+# Generamos matriz de correlaciones para medias, peores casos y errores estándar
+corrMatrix <- data %>% dplyr::select(contains("_mean")) %>% 
+  rename_with(.fn = ~gsub("_mean", "", .)) %>%
+  cor()
+
+corrMatrixMean <- ggcorrplot(corrMatrix, hc.order = FALSE, 
+                             title = "Correlación entre medias",
+                             type = "lower", lab = "TRUE",
+                             colors = c("#9E67AB", "white", "#E69F00"))
+
+corrMatrix <- data %>% dplyr::select(contains("_worst"))  %>% 
+  rename_with(.fn = ~gsub("_worst", "", .)) %>%
+  cor()
+corrMatrixWorst <- ggcorrplot(corrMatrix, hc.order = FALSE,
+                              title = "Correlación entre peores casos",
+                              type = "lower", lab = "TRUE",
+                              colors = c("#9E67AB", "white", "#E69F00"))
+
+corrMatrix <- data %>% dplyr::select(contains("_se"))  %>% 
+  rename_with(.fn = ~gsub("_se", "", .)) %>%
+  cor()
+corrMatrixSE <- ggcorrplot(corrMatrix, hc.order = FALSE,
+                           title = "Correlación entre errores estándar",
+                           type = "lower", lab = "TRUE",
+                           colors = c("#9E67AB", "white", "#E69F00"))
+
+corrMatrix <- data %>%
+  select(-id, -diagnosis) %>%
+  cor()
+
+# matriz de correlación con todas las variables
+corrMatrixAll <- ggcorrplot(corrMatrix, hc.order = FALSE, 
+                            title = "Correlación entre todas las variables",
+                            type = "lower", lab = "FALSE",
+                            colors = c("#9A009A", "white", "#BC8300"))
+
+corrMatrixMean; corrMatrixWorst; corrMatrixSE
+```
+
+```{r fig.height=9, fig.width=9, fig.align='center'}
+corrMatrixAll
+```
+
+
+**Gráficas de dispersión entre variables**
+
+```{r fig.width=12, fig.height=10}
+data %>% dplyr::select(contains("_mean"), diagnosis) %>%
+  plot(pch = 20, col = if_else(data$diagnosis == "B", "#E69F00","#9E67AB"))
+```
+
+```{r fig.width=12, fig.height=10}
+data %>% dplyr::select(contains("_worst"), diagnosis) %>%
+  plot(pch = 20, col = if_else(data$diagnosis == "B", "#E69F00","#9E67AB"))
+```
+
+```{r fig.width=12, fig.height=10}
+data %>% dplyr::select(contains("_se"), diagnosis) %>% 
+  plot(pch = 20, col = if_else(data$diagnosis == "B", "#E69F00","#9E67AB"))
+```
+
+
+
+## Gráficos para comparar grupos
+
+
+
+### Diagramas de caja
+
+```{r fig.width=12, fig.height=6}
+boxplotMean <- data %>%
+  dplyr::select(contains("_mean"), diagnosis) %>%
+  pivot_longer(cols = !diagnosis, names_to = "id", values_to = "value") %>%
+  ggplot(aes(x = id, y = value, fill = diagnosis)) +
+  geom_boxplot(notch = TRUE) +
+  facet_wrap(~id,scales="free", ncol = 5) +
+  scale_fill_manual(name = "diagnóstico", 
+                    labels = c("maligno", "benigno"), 
+                    values = c("#9E67AB" , "#E69F00")) +
+  theme_bw() +
+  theme(axis.text.x=element_blank(),
+        axis.ticks = element_blank(),
+        axis.title.x=element_blank(), 
+        axis.title.y = element_blank())
+boxplotMean
+```
+
+```{r fig.width=12, fig.height=6}
+boxplotWorst <- data %>%
+  dplyr::select(contains("_worst"), diagnosis) %>%
+  pivot_longer(cols = !diagnosis, names_to = "id", values_to = "value") %>%
+  ggplot(aes(x = id, y = value, fill = diagnosis)) +
+  geom_boxplot(notch = TRUE) +
+  facet_wrap(~id,scales="free", ncol = 5) +  
+  scale_fill_manual(name = "diagnóstico", 
+                    labels = c("maligno", "benigno"), 
+                    values = c("#9E67AB" , "#E69F00")) +
+  theme_bw() +
+  theme(axis.text.x=element_blank(),
+        axis.ticks = element_blank(),
+        axis.title.x=element_blank(), 
+        axis.title.y = element_blank())
+boxplotWorst
+```
+
+```{r fig.width=12, fig.height=6}
+boxplotSE <- data %>%
+  dplyr::select(contains("_se"), diagnosis) %>%
+  pivot_longer(cols = !diagnosis, names_to = "id", values_to = "value") %>%
+  ggplot(aes(x = id, y = value, fill = diagnosis)) +
+  geom_boxplot(notch = TRUE) +
+  facet_wrap(~id,scales="free", ncol = 5) +
+  scale_fill_manual(name = "diagnóstico", 
+                    labels = c("maligno", "benigno"), 
+                    values = c("#9E67AB" , "#E69F00")) +
+  theme_bw() +
+  theme(axis.text.x=element_blank(),
+        axis.ticks = element_blank(),
+        axis.title.x=element_blank(), 
+        axis.title.y = element_blank())
+boxplotSE
+```
+
+
+
+### Gráficas de densidad
+
+```{r fig.width=12, fig.height=6}
+plotMeanDensity <- data %>%
+  dplyr::select(contains("_mean"), diagnosis) %>%
+  pivot_longer(cols = !diagnosis, names_to = "id", values_to = "value") %>%
+  ggplot(aes(x = value, colour = diagnosis)) +
+  xlab("valor") +
+  ylab("densidad") +
+  geom_density(size = 1) +
+  facet_wrap(~id,scales="free", ncol = 5) +  
+  scale_colour_manual(name = "diagnóstico", 
+                      labels = c("maligno", "benigno"), 
+                      values = c("#9E67AB" , "#E69F00")) +
+  theme_bw() 
+plotMeanDensity
+```
+
+
+```{r fig.width=12, fig.height=6}
+plotWorstDensity <- data %>%
+  dplyr::select(contains("_worst"), diagnosis) %>%
+  pivot_longer(cols = !diagnosis, names_to = "id", values_to = "value") %>%
+  ggplot(aes(x = value, colour = diagnosis)) +
+  xlab("valor") +
+  ylab("densidad") +
+  geom_density(size = 1) +
+  facet_wrap(~id,scales="free", ncol = 5) +  
+  scale_colour_manual(name = "diagnóstico", 
+                      labels = c("maligno", "benigno"), 
+                      values = c("#9E67AB" , "#E69F00")) +
+  theme_bw() 
+plotWorstDensity
+```
+
+
+```{r fig.width=12, fig.height=6}
+plotSEDensity <- data %>%
+  dplyr::select(contains("_se"), diagnosis) %>%
+  pivot_longer(cols = !diagnosis, names_to = "id", values_to = "value") %>%
+  ggplot(aes(x = value, colour = diagnosis)) +
+  xlab("valor") +
+  ylab("densidad") +
+  geom_density(size = 1) +
+  facet_wrap(~id,scales="free", ncol = 5) +  
+  scale_colour_manual(name = "diagnóstico", 
+                      labels = c("maligno", "benigno"), 
+                      values = c("#9E67AB" , "#E69F00")) +
+  theme_bw() 
+plotSEDensity
+```
+
+## Comparación de medias entre grupos mediante test-t
+
+```{r}
+testT <- c()
+for (variable in colnames(data[-c(1,2)])) {
+  malign <- data %>%
+    filter(diagnosis == "M") %>%
+    pull(variable)
+  
+  benign <- data %>%
+    filter(diagnosis == "B") %>%
+    pull(variable)
+  
+  testT[variable] <- t.test(x = malign, y = benign, 
+                            paired = FALSE, conf.level = 0.95)$p.value
+  
+}
+
+isMeanDifferenceSignificant <- tibble(variable = colnames(data[-c(1,2)]), testT = testT)
+notSignificantVariables <- isMeanDifferenceSignificant %>%
+  filter(testT > 0.05) %>%
+  pull(variable)
+```
+
+## Análisis de Componentes Principales
+
+```{r}
+# Observamos si las escalas de las varianzas difieren de escala
+stanDev <- lapply(data[-c(1,2)], sd)
+stanDev %>%
+  unlist() %>%
+  summary()
+```
+
+```{r}
+# Ajustamos un PCA a nuestros datos utilizando la matriz de correlaciones
+PCA <- princomp(data[-c(1,2)],
+                cor = TRUE,
+                scores = TRUE
+)
+summary(PCA)
+```
+
+```{r}
+PCA$loadings[,1] %>%
+  .[which(abs(PCA$loadings[,1]) > 0.22)] %>%
+  round(3)
+```
+
+```{r}
+PCA$loadings[,2] %>%
+  .[which(abs(PCA$loadings[,2]) > 0.2)] %>%
+  round(3)
+```
+
+
+```{r fig.height=2, fig.width=8}
+# Representamos la proyección de nuestros datos sobre la primera componente
+plotPCA1 <- PCA$scores[, c(1,2)] %>%
+  cbind(data) %>%
+  ggplot(aes(x = Comp.1, y = "1")) +
+  geom_point(aes(colour = diagnosis), size = 2) +
+  scale_colour_manual(name = "diagnóstico", 
+                      labels = c("maligno", "benigno"), 
+                      values = c("#9E67AB" , "#E69F00")) +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.line.x = element_line(colour = "grey"),
+        legend.position = "bottom",
+        legend.title = element_blank())
+
+plotPCA1
+```
+
+```{r}
+# Representamos la proyección de nuestros datos sobre las 2 primeras componentes
+plotPCA2 <- PCA$scores[, c(1,2)] %>%
+  cbind(data) %>%
+  ggplot(aes(x = Comp.1, y = Comp.2)) +
+  geom_point(aes(colour = diagnosis)) +
+  scale_colour_manual(name = "diagnóstico", 
+                      labels = c("maligno", "benigno"), 
+                      values = c("#9E67AB" , "#E69F00"))
+
+plotPCA2
+```
+
+```{r}
+# Creamos un banco de datos con las componente para ajustar una posterior 
+# regresión logística sobre las componentes principales
+dataPCA <- PCA$scores[, c(1:30)] %>%
+  cbind(data %>% dplyr::select(diagnosis))
+```
+
+
+# Regresión logística
+
+## Sobre las componentes principales
+
+```{r}
+# Regresión logística sobre las dos primeras componentes principales
+set.seed(100)
+logisticPCA <- train(
+  form = diagnosis~Comp.1 + Comp.2,
+  data = dataPCA,
+  trControl = trainControl(method='repeatedcv', 
+                           number=10, 
+                           repeats=,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method = "glm",
+  family = "binomial"
+)
+```
+
+```{r}
+# Bucle sobre todas las componentes principales para calcular la precisión
+timeLogisticPCA <- Sys.time() # para medir tiempo de ejecución del script
+
+# Generamos dos vectores vacíos y una lista vacía
+accuracyCV <- rep(NA, 30)
+modelsPCA <- vector(mode = "list", length = 30)
+
+for (comp in 1:30) {
+  set.seed(100)
+  # ajustamos un modelo con n componentes principales
+  modelsPCA[[comp]] <- train(
+    form = paste0("diagnosis ~ ", paste0("Comp.", 1:comp, collapse = "+")) %>%
+      as.formula(),
+    data = dataPCA,
+    trControl = trainControl(method='repeatedcv',
+                             number=10,
+                             repeats=3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+    method = "glm",
+    family = "binomial"
+  )
+  
+  # obtenemos la precisión del modelo obtenida mediante validación cruzada
+  accuracyCV[comp] <- modelsPCA[[comp]]$results$Accuracy
+}
+
+# para medir tiempo de ejecución del script
+timeLogisticPCA <- Sys.time() - timeLogisticPCA
+timeLogisticPCA <- as.numeric(timeLogisticPCA, units="secs")
+```
+
+
+```{r fig.height=3, fig.width=6}
+# Generamos una gráfica para ver qué número de componentes es el óptimo
+plotAccuracyPCA <- tibble(componentes = 1:30, 
+                          accuracyCV = accuracyCV) %>%
+  # Convertimos a formato long para que ggplot lo lea bien
+  pivot_longer(cols = -componentes, names_to = "calculation", values_to = "exactitud") %>%
+  ggplot(aes(x = componentes, y = exactitud)) +
+  geom_point() + 
+  geom_line()
+
+plotAccuracyPCA
+```
+
+```{r}
+which(accuracyCV == max(accuracyCV))
+max(accuracyCV)
+```
+
+
+El número óptimo de componentes principales parecen ser 9. La precisión comienza a estancarse y a empeorar claramente a partir de las 10 componentes principales.
+
+
+## Sobre las variables originales de forma manual
+
+```{r}
+# Eliminamos el id del paciente del banco de datos, ya que no nos hace falta
+data <- data[-1]
+```
+
+```{r}
+# Sobre todas las variables
+set.seed(100)
+logisticFull <- train(
+  form = diagnosis~.,
+  data = data,
+  trControl = trainControl(method='repeatedcv', 
+                           number=10, 
+                           repeats=3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method = "glm",
+  family = "binomial"
+)
+```
+
+```{r}
+# Eliminamos las 4 variables cuya diferencia entre las medias no ha resultado
+# significativa al aplicar los test t
+dataNotSignificant <- data %>%
+  select(-all_of(notSignificantVariables))
+```
+
+```{r}
+# Sobre todas las variables
+set.seed(100)
+logisticFull2 <- train(
+  form = diagnosis~.,
+  data = dataNotSignificant,
+  trControl = trainControl(method='repeatedcv', 
+                           number=10, 
+                           repeats=3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method = "glm",
+  family = "binomial"
+)
+```
+
+
+## Eliminando variables muy correlacionadas entre sí que puedan ser redundantes
+
+```{r}
+# Generamos matriz de correlación de todas las covariables
+corrMatrix <- data %>%
+  dplyr::select(contains("_")) %>%
+  cor()
+
+# Buscamos todas las posiciones con una correlación superior a 0.95
+positions <- which(corrMatrix > 0.95 & corrMatrix != 1)
+rows <- ceiling(positions / nrow(corrMatrix))
+columns <- nrow(corrMatrix) - (nrow(corrMatrix) * rows - positions)
+
+# Obtenemos tabla con todas las correlaciones más altas de 0.95
+corrTable95 <- tibble(variable1 = rownames(corrMatrix)[rows],
+                      variable2 = colnames(corrMatrix)[columns],
+                      correlation = corrMatrix[positions])
+
+# Eliminamos los casos repetidos
+corrTable95 <- corrTable95 %>%
+  distinct(correlation, .keep_all = TRUE)
+
+# y sacamos las variables a eliminar de futuros modelos
+redundantCols95 <- corrTable95 %>%
+  dplyr::select(variable1) %>%
+  pull() %>%
+  unique()
+redundantCols95
+```
+
+```{r}
+# Eliminamos manualmente las variables que están altamente correlacionadas entre sí
+set.seed(100)
+logisticCorr95 <- train(
+  form = diagnosis~.,
+  data = data %>% dplyr::select(-any_of(unique(c(redundantCols95,
+                                                 notSignificantVariables)))),
+  trControl = trainControl(method='repeatedcv', 
+                           number=10, 
+                           repeats=3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method = "glm",
+  family = "binomial"
+)
+```
+
+```{r}
+# Buscamos todas las posiciones con una correlación superior a 0.9
+positions <- which(corrMatrix > 0.9 & corrMatrix != 1)
+rows <- ceiling(positions / nrow(corrMatrix))
+columns <- nrow(corrMatrix) - (nrow(corrMatrix) * rows - positions)
+
+# Obtenemos tabla con todas las correlaciones más altas de 0.9
+corrTable90 <- tibble(variable1 = rownames(corrMatrix)[rows],
+                      variable2 = colnames(corrMatrix)[columns],
+                      correlation = corrMatrix[positions])
+
+# Eliminamos los casos repetidos
+corrTable90 <- corrTable90 %>%
+  distinct(correlation, .keep_all = TRUE)
+
+# y sacamos las variables a eliminar de futuros modelos
+redundantCols90 <- corrTable90 %>%
+  dplyr::select(variable1) %>%
+  pull() %>%
+  unique()
+
+redundantCols90
+
+# Eliminamos manualmente las variables que están altamente correlacionadas entre sí
+set.seed(100)
+logisticCorr90 <- train(
+  form = diagnosis~.,
+  data = data %>% dplyr::select(-any_of(unique(c(redundantCols90, 
+                                                 notSignificantVariables)))),
+  trControl = trainControl(method='repeatedcv', 
+                           number=10, 
+                           repeats=3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method = "glm",
+  family = "binomial"
+)
+```
+
+## Añadiendo sólo las variables que hayan tenido un gran aporte en las primeras componentes principales
+
+```{r}
+# Seleccionamos las variables con una importancia superior a 0.25
+# en las primeras 3 componentes
+
+# Son los parámetros óptimos tras probar con varias importancias 
+# y varios número de componentes principales
+variablesPCA <- c()
+for (i in 1:9) {
+  variable <- PCA$loadings[,i] %>%
+    .[which(abs(PCA$loadings[,i]) > 0.25)] %>%
+    names()
+  
+  variablesPCA <- c(variablesPCA, variable)
+}
+
+variablesPCA <- unique(variablesPCA)
+variablesPCA <- variablesPCA[!variablesPCA %in% notSignificantVariables]
+```
+
+```{r}
+# Seleccionamos sólo las variables de gran importancia en las primeras CP
+set.seed(100)
+logisticImportance <- train(
+  form = paste0("diagnosis ~ ", paste0(variablesPCA, collapse = "+")) %>%
+    as.formula(),
+  data = data,
+  trControl = trainControl(method='repeatedcv',
+                           number=10,
+                           repeats=3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method = "glm",
+  family = "binomial"
+)
+```
+
+
+
+## Utilizando métodos stepwise
+
+```{r cache=TRUE}
+# Stepwise backward
+set.seed(100)
+logisticBackward <- train(
+  form = diagnosis~.,
+  data = data %>% select(-all_of(notSignificantVariables)),
+  trControl = trainControl(method='repeatedcv', 
+                           number=10,
+                           repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method = "glmStepAIC",
+  trace = 0,
+  family = "binomial",
+  direction = "backward",
+  preProc = c("center", "scale")
+)
+```
+
+
+```{r}
+length(logisticBackward$finalModel$coefficients)
+```
+
+```{r cache=TRUE}
+# Stepwise forward
+set.seed(100)
+logisticForward <- train(
+  form = diagnosis~.,
+  data = data %>% select(-all_of(notSignificantVariables)),
+  trControl = trainControl(method='repeatedcv', 
+                           number=10,
+                           repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method = "glmStepAIC",
+  trace = 0,
+  family = "binomial",
+  direction = "forward"
+)
+```
+
+```{r}
+length(logisticForward$finalModel$coefficients)
+```
+
+
+## Métodos stepwise pero utilizando la exactitud como métrica 
+
+```{r warning = FALSE}
+# Stepwise forward custom usando exactitud como métrica
+
+timeLogisticAccuracyForward <- Sys.time() # para medir tiempo de ejecución del script
+
+# inicializamos las variables necesarias
+subset <- c()
+variables <- names(data[-1])
+bestAccuracy <- 0
+
+# Iteramos sobre todas las variables del banco de datos
+for (i in seq_along(variables)) {
+  # print(paste("iteración", i))
+  k <- 0
+  
+  # iteramos sobre todas las covariables que no hayan sida ya seleccionadas
+  for (j in variables[!variables %in% subset]) {
+    k <- k+1
+    # print(paste("modelo", k))
+    
+    # actualizamos los datos sobre los que ajustar el modelo
+    subset <- c(subset, j)
+    subsetData <- data %>% select(c(subset, "diagnosis"))
+    set.seed(100)
+    # ajustamos modelo con la nueva covariable
+    model <- train(
+      form = diagnosis~.,
+      data = subsetData,
+      trControl = trainControl(method='repeatedcv', 
+                               number=10, 
+                               repeats=3,
+                               classProbs = TRUE,
+                               savePredictions="final",
+                               summaryFunction = multiClassSummary),
+      method = "glm",
+      family = "binomial"
+    )
+    
+    # guardamos la exactitud del modelo
+    accuracy <- model$results$Accuracy
+    # print(subset)
+    # print(accuracy)
+    
+    # si la exactitud es más alta que la mejor hasta ahora,
+    ## actualizamos mejor modelo y mejor exactitud
+    if (accuracy > bestAccuracy) {
+      bestModel <- model
+      bestAccuracy <- accuracy
+      bestAddedVariable <- j
+    }
+    # eliminamos esta última variable del subconjunto y probamos con la siguiente
+    subset <- subset[-length(subset)]
+  }
+  
+  # si ninguna de las variables añadidas mejora la exactitud, salir del bucle
+  if (bestAddedVariable %in% subset) {
+   break 
+  }
+  
+  # añadir la variable que más ha mejorado la exactitud del modelo
+  subset <- c(subset, bestAddedVariable)
+  
+}
+
+# para medir tiempo de ejecución del script
+timeLogisticAccuracyForward <- Sys.time() - timeLogisticAccuracyForward
+timeLogisticAccuracyForward <- as.numeric(timeLogisticAccuracyForward, units="secs")
+
+logisticAccuracyForward <- bestModel
+logisticAccuracyForward$finalModel$xNames
+```
+
+```{r warning = FALSE}
+# Stepwise backward custom usando exactitud como métrica
+
+timeLogisticAccuracyBackward <- Sys.time() # para medir tiempo de ejecución del script
+
+# inicializamos las variables necesarias
+eliminated <- c()
+variables <- names(data[-1])
+
+# tomamos de partida la exactitud del modelo con todas las covariables
+bestAccuracy <- logisticFull$results$Accuracy
+bestModel <- logisticFull
+
+# Iteramos sobre todas las variables del banco de datos
+for (i in seq_along(variables)) {
+  # print(paste("iteración", i))
+  k <- 0
+  
+  # iteramos sobre todas las covariables que no hayan sida ya eliminadas
+  for (j in variables[!variables %in% eliminated]) {
+    k <- k+1
+    # print(paste("modelo", k))
+    
+    # actualizamos los datos sobre los que ajustar el modelo
+    eliminated <- c(eliminated, j)
+    subsetData <- data %>% select(-any_of(eliminated))
+    set.seed(100)
+    # ajustamos modelo eliminando una covariable
+    model <- train(
+      form = diagnosis~.,
+      data = subsetData,
+      trControl = trainControl(method='repeatedcv', 
+                               number=10, 
+                               repeats=3,
+                               classProbs = TRUE,
+                               savePredictions="final",
+                               summaryFunction = multiClassSummary),
+      method = "glm",
+      family = "binomial"
+    )
+    
+    # guardamos la exactitud del modelo
+    accuracy <- model$results$Accuracy
+    # print(eliminated)
+    # print(accuracy)
+    
+    # si la exactitud es más alta que la mejor hasta ahora,
+    ## actualizamos mejor modelo y mejor exactitud
+    if (accuracy > bestAccuracy) {
+      bestModel <- model
+      bestAccuracy <- accuracy
+      bestEliminatedVariable <- j
+    }
+    # eliminamos esta última variable del conjunto de eliminadas y probamos con la siguiente
+    eliminated <- eliminated[-length(eliminated)]
+  }
+  
+  # si ninguna de las variables eliminadas mejora la exactitud, salir del bucle
+  if (bestEliminatedVariable %in% eliminated) {
+   break 
+  }
+  
+  # eliminar la covariable cuya eliminación más ha mejorado la exactitud del modelo
+  eliminated <- c(eliminated, bestEliminatedVariable)
+  
+}
+
+# para medir tiempo de ejecución del script
+timeLogisticAccuracyBackward <- Sys.time() - timeLogisticAccuracyBackward
+timeLogisticAccuracyBackward <- as.numeric(timeLogisticAccuracyBackward, units="secs")
+
+logisticAccuracyBackward <- bestModel
+logisticAccuracyBackward$finalModel$xNames
+```
+
+## Regresión con penalización
+
+```{r}
+x <- model.matrix(diagnosis~., data %>% select(-all_of(notSignificantVariables)))[,-1]
+y <- data$diagnosis
+```
+
+### Ridge
+
+```{r}
+# Ajustamos ridge por defecto
+par(mfrow = c(1, 2))
+set.seed(100)
+ridgeDefault <- glmnet(x, y, alpha = 0, family = "binomial")
+plot(ridgeDefault)
+plot(ridgeDefault, xvar = "lambda", label = TRUE)
+```
+
+```{r}
+# Validación cruzada para encontrar el lambda óptimo
+set.seed(100)
+ridgeCV <- cv.glmnet(x, y, family = "binomial", alpha = 0)
+plot(ridgeCV)
+```
+
+```{r}
+# término de penalización, utilizando la lambda 1SE
+sum(coef(ridgeCV, s = "lambda.1se")[-1] ^ 2)
+
+# término de penalización, utilizando la lamba mínima
+sum(coef(ridgeCV, s = "lambda.min")[-1] ^ 2)
+```
+
+```{r}
+ridgeCV$lambda.1se
+ridgeCV$lambda.min
+```
+
+```{r}
+# Probamos con ambos valores de lambda para ver cual es la exactitud del modelo
+ridgeGrid <- expand.grid(alpha = 0, 
+                         lambda = c(ridgeCV$lambda.min, ridgeCV$lambda.1se))
+
+set.seed(100)
+ridgeFit <- train(
+  diagnosis ~ ., 
+  data = data %>% select(-all_of(notSignificantVariables)),
+  method = "glmnet",
+  trControl = trainControl(method = "cv", number = 10, repeats = 3),
+  tuneGrid = ridgeGrid
+)
+```
+
+```{r}
+# Probamos un grid de opciones con más lambas alrededor de los dos óptimos.
+ridgeGrid <- expand.grid(alpha = 0, 
+                         lambda = seq(from = 0, to = 0.07, by = 0.0001))
+set.seed(100)
+ridgeFit <- train(
+  diagnosis ~ ., 
+  data = data %>% select(-all_of(notSignificantVariables)),
+  method = "glmnet",
+  trControl = trainControl(method = "repeatedcv",
+                           number = 10, 
+                           repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  tuneGrid = ridgeGrid
+)
+```
+
+```{r}
+# Probamos a eliminar previamente variables muy correlacionadas (>0.95)
+ridgeGrid <- expand.grid(alpha = 0, 
+                         lambda = seq(from = 0, to = 0.07, by = 0.0001))
+set.seed(100)
+ridgeFit95 <- train(
+  diagnosis ~ ., 
+  data = data %>% select(-any_of(unique(c(redundantCols95,
+                                          notSignificantVariables)))),
+  method = "glmnet",
+  trControl = trainControl(method = "repeatedcv",
+                           number = 10, 
+                           repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  tuneGrid = ridgeGrid
+)
+```
+
+```{r}
+# Probamos a eliminar previamente variables muy correlacionadas (>0.9)
+ridgeGrid <- expand.grid(alpha = 0, 
+                         lambda = seq(from = 0, to = 0.07, by = 0.0001))
+set.seed(100)
+ridgeFit90 <- train(
+  diagnosis ~ ., 
+  data = data %>% select(-any_of(unique(c(redundantCols90,
+                                          notSignificantVariables)))),
+  method = "glmnet",
+  trControl = trainControl(method = "repeatedcv",
+                           number = 10, 
+                           repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  tuneGrid = ridgeGrid
+)
+```
+
+
+### Lasso
+
+```{r}
+# Lasso
+par(mfrow = c(1, 2))
+set.seed(100)
+lassoDefault <- glmnet(x, y, alpha = 1, family = "binomial")
+plot(lassoDefault)
+plot(lassoDefault, xvar = "lambda", label = TRUE)
+
+```
+
+```{r}
+# Validación cruzada para encontrar el lambda óptimo
+set.seed(100)
+lassoCV <- cv.glmnet(x, y, family = "binomial", alpha = 1)
+plot(lassoCV)
+
+lassoCV$lambda.1se
+lassoCV$lambda.min
+```
+
+```{r}
+# Probamos con ambos valores de lambda para ver cual es la exactitud del modelo
+lassoGrid <- expand.grid(alpha = 1, 
+                         lambda = c(lassoCV$lambda.min, lassoCV$lambda.1se))
+
+set.seed(100)
+lassoFit <- train(
+  diagnosis ~ ., 
+  data = data %>% select(-all_of(notSignificantVariables)),
+  method = "glmnet",
+  trControl = trainControl(method = "cv", number = 10, repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  tuneGrid = lassoGrid
+)
+```
+
+```{r cache=TRUE}
+# Probamos un grid de opciones con más lambas alrededor de los dos óptimos.
+lassoGrid <- expand.grid(alpha = 1, 
+                         lambda = seq(from = 0, to = 0.05, by = 0.0001))
+
+set.seed(100)
+lassoFit <- train(
+  diagnosis ~ ., 
+  data = data %>% select(-all_of(notSignificantVariables)),
+  method = "glmnet",
+  trControl = trainControl(method = "repeatedcv", number = 10, repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  tuneGrid = lassoGrid
+)
+```
+
+```{r cache=TRUE}
+# Probamos a eliminar previamente variables muy correlacionadas (>0.95)
+lassoGrid <- expand.grid(alpha = 1, 
+                         lambda = seq(from = 0, to = 0.05, by = 0.0001))
+
+set.seed(100)
+lassoFit95 <- train(
+  diagnosis ~ ., 
+  data = data %>% select(-any_of(unique(c(redundantCols95, 
+                                          notSignificantVariables)))),
+  method = "glmnet",
+  trControl = trainControl(method = "repeatedcv", number = 10, repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  tuneGrid = lassoGrid
+)
+```
+
+```{r cache=TRUE}
+# Probamos a eliminar previamente variables muy correlacionadas (>0.9)
+lassoGrid <- expand.grid(alpha = 1, 
+                         lambda = seq(from = 0, to = 0.05, by = 0.0001))
+
+set.seed(100)
+lassoFit90 <- train(
+  diagnosis ~ ., 
+  data = data %>% select(-any_of(unique(c(redundantCols90,
+                                          notSignificantVariables)))),
+  method = "glmnet",
+  trControl = trainControl(method = "repeatedcv", number = 10, repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  tuneGrid = lassoGrid
+)
+```
+
+### Elastic net
+
+```{r cache=TRUE}
+# Elastic net
+elnetGrid <- expand.grid(alpha = seq(from = 0, to = 0.5, by = 0.05), 
+                         lambda = seq(from = 0, to = 0.01, by = 0.0005))
+
+set.seed(100)
+elnetFit <- train(
+  diagnosis ~ ., 
+  data = data %>% select(-all_of(notSignificantVariables)),
+  method = "glmnet",
+  trControl = trainControl(method = "repeatedcv", number = 10, repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  tuneGrid = elnetGrid
+)
+```
+
+```{r cache=TRUE}
+# Probamos a eliminar previamente variables muy correlacionadas (>0.95)
+elnetGrid <- expand.grid(alpha = seq(from = 0, to = 0.5, by = 0.05), 
+                         lambda = seq(from = 0, to = 0.01, by = 0.0005))
+
+set.seed(100)
+elnetFit95 <- train(
+  diagnosis ~ ., 
+  data = data %>% select(-any_of(unique(c(redundantCols95,
+                                          notSignificantVariables)))),
+  method = "glmnet",
+  trControl = trainControl(method = "repeatedcv", number = 10, repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  tuneGrid = elnetGrid
+)
+```
+
+
+```{r cache=TRUE}
+# Probamos a eliminar previamente variables muy correlacionadas (>0.9)
+elnetGrid <- expand.grid(alpha = seq(from = 0, to = 0.5, by = 0.05), 
+                         lambda = seq(from = 0, to = 0.01, by = 0.0005))
+
+set.seed(100)
+elnetFit90 <- train(
+  diagnosis ~ ., 
+  data = data %>% select(-any_of(unique(c(redundantCols90,
+                                          notSignificantVariables)))),
+  method = "glmnet",
+  trControl = trainControl(method = "repeatedcv", number = 10, repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  tuneGrid = elnetGrid
+)
+```
+
+# Linear Discriminant analysis
+
+## Sobre todas las covariables
+
+```{r}
+# sobre todas las variables
+lda1 <- train(
+  form = diagnosis ~ .,
+  data = data,
+  trControl = trainControl(method='repeatedcv', 
+                           number=10, 
+                           repeats=3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method="lda")
+```
+
+## Sobre las componentes principales
+
+```{r fig.height=3, fig.width=6}
+# Bucle sobre todas las componentes principales para calcular la precisión
+timeLdaPCA <- Sys.time() # para medir tiempo de ejecución del script
+
+# Generamos dos vectores vacíos y una lista vacía
+ldaAccuracyCV <- rep(NA, 30)
+ldaPCA <- vector(mode = "list", length = 30)
+
+for (comp in 1:30) {
+  set.seed(100)
+  # ajustamos un modelo con n componentes principales
+  ldaPCA[[comp]] <- train(
+    form = paste0("diagnosis ~ ", paste0("Comp.", 1:comp, collapse = "+")) %>%
+      as.formula(),
+    data = dataPCA,
+    trControl = trainControl(method='repeatedcv',
+                             number=10,
+                             repeats=3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+    method = "lda"
+  )
+  
+  # obtenemos la precisión del modelo obtenida mediante validación cruzada
+  ldaAccuracyCV[comp] <- ldaPCA[[comp]]$results$Accuracy
+}
+
+# para medir tiempo de ejecución del script
+timeLdaPCA <- Sys.time() - timeLdaPCA
+timeLdaPCA <- as.numeric(timeLdaPCA, units="secs")
+
+# Generamos una gráfica para ver qué número de componentes es el óptimo
+plotAccuracyLdaPCA <- tibble(componentes = 1:30,
+                             ldaAccuracyCV = ldaAccuracyCV) %>%
+  # Convertimos a formato long para que ggplot lo lea bien
+  pivot_longer(cols = -componentes,
+               names_to = "calculation", values_to = "exactitud") %>%
+  ggplot(aes(x = componentes, y = exactitud)) +
+  geom_point() + 
+  geom_line()
+
+plotAccuracyLdaPCA
+```
+
+## Eliminando variables de forma manual
+
+```{r}
+# Eliminando variables muy correlacionadas
+set.seed(100)
+lda95 <- train(
+  form = diagnosis ~ .,
+  data = data %>% dplyr::select(-c(redundantCols95, notSignificantVariables)),
+  trControl = trainControl(method='repeatedcv', 
+                           number=10, 
+                           repeats=3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method="lda")
+lda95$results
+
+set.seed(100)
+lda90 <- train(
+  form = diagnosis ~ .,
+  data = data %>% dplyr::select(-c(redundantCols90, notSignificantVariables)),
+  trControl = trainControl(method='repeatedcv', 
+                           number=10, 
+                           repeats=3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method="lda")
+lda90$results
+
+# Seleccionamos sólo las variables de gran importancia en las primeras CP
+set.seed(100)
+ldaImportance <- train(
+  form = paste0("diagnosis ~ ", paste0(variablesPCA, collapse = "+")) %>%
+    as.formula(),
+  data = data,
+  trControl = trainControl(method='repeatedcv',
+                           number=10,
+                           repeats=3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method = "lda")
+
+# observamos la precisión calculada por CV
+ldaImportance$results$Accuracy
+```
+
+
+## Métodos stepwise pero utilizando la exactitud como métrica 
+
+```{r warning = FALSE}
+# Stepwise forward custom usando exactitud como métrica
+
+timeLdaAccuracyForward <- Sys.time() # para medir tiempo de ejecución del script
+
+# inicializamos las variables necesarias
+subset <- c()
+variables <- names(data[-1])
+bestAccuracy <- 0
+
+# Iteramos sobre todas las variables del banco de datos
+for (i in seq_along(variables)) {
+  # print(paste("iteración", i))
+  k <- 0
+  
+  # iteramos sobre todas las covariables que no hayan sida ya seleccionadas
+  for (j in variables[!variables %in% subset]) {
+    k <- k+1
+    # print(paste("modelo", k))
+    
+    # actualizamos los datos sobre los que ajustar el modelo
+    subset <- c(subset, j)
+    subsetData <- data %>% select(c(subset, "diagnosis"))
+    set.seed(100)
+    # ajustamos modelo con la nueva covariable
+    model <- train(
+      form = diagnosis ~ .,
+      data = subsetData,
+      trControl = trainControl(method='repeatedcv', 
+                               number=10, 
+                               repeats=3,
+                               classProbs = TRUE,
+                               savePredictions="final",
+                               summaryFunction = multiClassSummary),
+      method="lda")
+    
+    # guardamos la exactitud del modelo
+    accuracy <- model$results$Accuracy
+    # print(subset)
+    # print(accuracy)
+    
+    # si la exactitud es más alta que la mejor hasta ahora, 
+    ## actualizamos mejor modelo y mejor exactitud
+    if (accuracy > bestAccuracy) {
+      bestModel <- model
+      bestAccuracy <- accuracy
+      bestAddedVariable <- j
+    }
+    # eliminamos esta última variable del subconjunto y probamos con la siguiente
+    subset <- subset[-length(subset)]
+  }
+  
+  # si ninguna de las variables añadidas mejora la exactitud, salir del bucle
+  if (bestAddedVariable %in% subset) {
+   break 
+  }
+  
+  # añadir la variable que más ha mejorado la exactitud del modelo
+  subset <- c(subset, bestAddedVariable)
+  
+}
+
+# para medir tiempo de ejecución del script
+timeLdaAccuracyForward <- Sys.time() - timeLdaAccuracyForward
+timeLdaAccuracyForward <- as.numeric(timeLdaAccuracyForward, units="secs")
+
+ldaAccuracyForward <- bestModel
+ldaAccuracyForward$finalModel$xNames
+```
+
+```{r warning = FALSE}
+# Stepwise backward custom usando exactitud como métrica
+
+timeLdaAccuracyBackward <- Sys.time() # para medir tiempo de ejecución del script
+
+# inicializamos las variables necesarias
+eliminated <- c()
+variables <- names(data[-1])
+
+# tomamos de partida la exactitud del modelo con todas las covariables
+bestAccuracy <- lda1$results$Accuracy
+bestModel <- lda1
+
+# Iteramos sobre todas las variables del banco de datos
+for (i in seq_along(variables)) {
+  # print(paste("iteración", i))
+  k <- 0
+  
+  # iteramos sobre todas las covariables que no hayan sida ya eliminadas
+  for (j in variables[!variables %in% eliminated]) {
+    k <- k+1
+    # print(paste("modelo", k))
+    
+    # actualizamos los datos sobre los que ajustar el modelo
+    eliminated <- c(eliminated, j)
+    subsetData <- data %>% select(-any_of(eliminated))
+    set.seed(100)
+    # ajustamos modelo eliminando una covariable
+    model <- train(
+      form = diagnosis ~ .,
+      data = subsetData,
+      trControl = trainControl(method='repeatedcv', 
+                               number=10, 
+                               repeats=3,
+                               classProbs = TRUE,
+                               savePredictions="final",
+                               summaryFunction = multiClassSummary),
+      method="lda")
+    
+    # guardamos la exactitud del modelo
+    accuracy <- model$results$Accuracy
+    # print(eliminated)
+    # print(accuracy)
+    
+    # si la exactitud es más alta que la mejor hasta ahora, 
+    ## actualizamos mejor modelo y mejor exactitud
+    if (accuracy > bestAccuracy) {
+      bestModel <- model
+      bestAccuracy <- accuracy
+      bestEliminatedVariable <- j
+    }
+    # eliminamos esta última variable del conjunto de eliminadas y probamos con la siguiente
+    eliminated <- eliminated[-length(eliminated)]
+  }
+  
+  # si ninguna de las variables eliminadas mejora la exactitud, salir del bucle
+  if (bestEliminatedVariable %in% eliminated) {
+   break 
+  }
+  
+  # eliminar la covariable cuya eliminación más ha mejorado la exactitud del modelo
+  eliminated <- c(eliminated, bestEliminatedVariable)
+  
+}
+
+# para medir tiempo de ejecución del script
+timeLdaAccuracyBackward <- Sys.time() - timeLdaAccuracyBackward
+timeLdaAccuracyBackward <- as.numeric(timeLdaAccuracyBackward, units="secs")
+
+ldaAccuracyBackward <- bestModel
+ldaAccuracyBackward$finalModel$xNames
+```
+
+# K-vecinos más cercanos
+
+```{r}
+# Selección del número de vecinos óptimo
+set.seed(100)
+knn1 <- train(
+  form = diagnosis~.,
+  data = data %>% select(-all_of(notSignificantVariables)),
+  trControl = trainControl(method='repeatedcv', 
+                           number=10,
+                           repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method = "knn",
+  preProc = c("center", "scale"),
+  tuneGrid = expand.grid(k = seq(1,30, by = 1))
+)
+```
+
+```{r fig.height=3, fig.width=6}
+plotAccuracyKnn <- 
+  ggplot(data = knn1$results, mapping = aes(x = k, y = Accuracy)) +
+  geom_point() +
+  geom_line() + 
+  labs(y= "Exactitud", x = "nº de vecinos")
+plotAccuracyKnn
+```
+
+
+
+```{r}
+# Eliminamos variables correlacionadas al 90% o más
+set.seed(100)
+knn2 <- train(
+  form = diagnosis~.,
+  data = data %>% dplyr::select(-any_of(c(redundantCols90, notSignificantVariables))),
+  trControl = trainControl(method='repeatedcv', 
+                           number=10,
+                           repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method = "knn",
+  preProc = c("center", "scale"),
+  tuneGrid = expand.grid(k = seq(1,30, by = 1))
+)
+```
+
+```{r}
+# Eliminamos variables correlacionadas al 95% o más
+set.seed(100)
+knn3 <- train(
+  form = diagnosis~.,
+  data = data %>% dplyr::select(-any_of(c(redundantCols95, notSignificantVariables))),
+  trControl = trainControl(method='repeatedcv', 
+                           number=10,
+                           repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method = "knn",
+  preProc = c("center", "scale"),
+  tuneGrid = expand.grid(k = seq(1,30, by = 1))
+)
+```
+
+```{r}
+# Selección del número de vecinos óptimo y del tipo de distancia óptmimo
+set.seed(100)
+kknn1 <- train(
+  form = diagnosis~.,
+  data = data %>% select(-all_of(notSignificantVariables)),
+  trControl = trainControl(method='repeatedcv', 
+                           number=10,
+                           repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method = "kknn",
+  preProc = c("center", "scale"),
+  tuneGrid = expand.grid(kmax = 30,
+                         distance = 1, # 1 = Manhattan; 2 = Euclídea
+                         kernel = 'optimal')
+)
+```
+
+```{r}
+# Eliminamos variables correlacionadas al 90% o más
+set.seed(100)
+kknn2 <- train(
+  form = diagnosis~.,
+  data = data %>% dplyr::select(-any_of(c(redundantCols90, notSignificantVariables))),
+  trControl = trainControl(method='repeatedcv', 
+                           number=10,
+                           repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method = "kknn",
+  preProc = c("center", "scale"),
+  tuneGrid = expand.grid(kmax = 30,
+                         distance = 1, # 1 = Manhattan; 2 = Euclídea
+                         kernel = 'optimal')
+)
+```
+
+
+```{r}
+# Eliminamos variables correlacionadas al 95% o más
+set.seed(100)
+kknn3 <- train(
+  form = diagnosis~.,
+  data = data %>% dplyr::select(-any_of(c(redundantCols95, notSignificantVariables))),
+  trControl = trainControl(method='repeatedcv', 
+                           number=10,
+                           repeats = 3,
+                           classProbs = TRUE,
+                           savePredictions="final",
+                           summaryFunction = multiClassSummary),
+  method = "kknn",
+  preProc = c("center", "scale"),
+  tuneGrid = expand.grid(kmax = 30,
+                         distance = 1, # 1 = Manhattan; 2 = Euclídea
+                         kernel = 'optimal')
+)
+```
+
+# Modelos con árboles de decisión
+
+## Un único árbol de decisión
+
+```{r}
+# Un único arbol de decisión
+set.seed(100)
+decisionTree <- train(diagnosis ~ ., 
+                      data=data %>% select(-all_of(notSignificantVariables)), 
+                      method="rpart", 
+                      trControl = trainControl(method = "repeatedcv", 
+                                               number = 10,
+                                               repeats = 3,
+                                               classProbs = TRUE,
+                                               savePredictions="final",
+                                               summaryFunction = multiClassSummary),
+                      tuneLength = 10
+)
+```
+
+```{r}
+# Modelo controlando el parámetro de complejidad
+treeGrid <- data.frame(cp = seq(0, .2, .01))
+set.seed(100)
+decisionTreeCp <- train(diagnosis ~ ., 
+                        data=data %>% select(-all_of(notSignificantVariables)), 
+                        method="rpart", 
+                        trControl = trainControl(method = "repeatedcv", 
+                                                 number = 10,
+                                                 repeats = 3,
+                                                 classProbs = TRUE,
+                                                 savePredictions="final",
+                                                 summaryFunction = multiClassSummary),
+                        tuneGrid = treeGrid
+)
+```
+
+```{r fig.width=5, fig.height=4}
+rpart.plot::rpart.plot(decisionTreeCp$finalModel)
+```
+
+
+```{r}
+# Ajustamos un modelo controlando la profundidad máxima del árbol
+treeGrid <- data.frame(maxdepth = 2:8)
+set.seed(100)
+decisionTreeMaxDepth <- train(diagnosis ~ ., 
+                              data=data %>% select(-all_of(notSignificantVariables)), 
+                              method="rpart2", 
+                              trControl = trainControl(method = "repeatedcv", 
+                                                       number = 10,
+                                                       repeats = 3,
+                                                       classProbs = TRUE,
+                                                       savePredictions="final",
+                                                       summaryFunction = multiClassSummary),
+                              tuneGrid = treeGrid
+)
+```
+
+```{r fig.width=5, fig.height=4}
+rpart.plot::rpart.plot(decisionTreeMaxDepth$finalModel)
+```
+
+Eliminando covariables muy correlacionadas:
+
+```{r}
+# Arbol de decisión eliminando variables muy correlacionadas (>0.9)
+treeGrid <- data.frame(maxdepth = 2:8)
+set.seed(100)
+decisionTreeMaxDepthCorr90 <- train(diagnosis ~ ., 
+                                    data=data %>% select(-c(redundantCols90,
+                                                            notSignificantVariables)), 
+                                    method="rpart2", 
+                                    trControl = trainControl(method = "repeatedcv", 
+                                                             number = 10,
+                                                             repeats = 3,
+                                                             classProbs = TRUE,
+                                                             savePredictions="final",
+                                                             summaryFunction = multiClassSummary),
+                                    tuneGrid = treeGrid
+)
+```
+
+```{r fig.width=5, fig.height=4}
+rpart.plot::rpart.plot(decisionTreeMaxDepthCorr90$finalModel)
+```
+
+
+```{r}
+# Arbol de decisión eliminando variables muy correlacionadas (>0.95)
+treeGrid <- data.frame(maxdepth = 2:8)
+set.seed(100)
+decisionTreeMaxDepthCorr95 <- train(diagnosis ~ ., 
+                                    data=data %>% select(-c(redundantCols95,
+                                                            notSignificantVariables)), 
+                                    method="rpart2", 
+                                    trControl = trainControl(method = "repeatedcv", 
+                                                             number = 10,
+                                                             repeats = 3,
+                                                             classProbs = TRUE,
+                                                             savePredictions="final",
+                                                             summaryFunction = multiClassSummary),
+                                    tuneGrid = treeGrid
+)
+```
+
+```{r}
+rpart.plot::rpart.plot(decisionTreeMaxDepthCorr95$finalModel)
+```
+
+Vamos a observar la importancia de cada covariable estimada por el árbol de decisión, medida como el decrecimiento del índice de Gini que se obtiene al realizar una partición del banco de datos 
+
+```{r}
+variableImportance <- 
+  tibble(variable = names(decisionTreeMaxDepth$finalModel$variable.importance),
+                             importancia = decisionTreeMaxDepth$finalModel$variable.importance)
+
+variableImportance %>%
+  arrange(importancia) %>%
+  mutate(variable = factor(variable, levels = variable)) %>%
+  ggplot(aes(x = importancia, y = variable)) +
+  geom_col()
+```
+
+
+## Búsqueda aleatoria del mejor árbol
+
+```{r cache=TRUE}
+# Probamos árboles de decisión seleccionando n variables al azar
+numVariables <- 3:12
+
+bestAccuracyTree <- 0
+
+# para medir tiempo de ejecución del script
+timeRandomTree <- Sys.time()
+
+for (n in numVariables) {
+  
+  for (i in 1:10) {
+    
+    treeGrid <- data.frame(maxdepth = 2:5)
+    # generamos un subconjunto aleatorio de n variables
+    set.seed(i)
+    trainRandomTree <- data %>% select(diagnosis, sample(x = colnames(data[-1] %>%
+                                                                        select(-all_of(notSignificantVariables))), size = n))
+    
+    # generamos los árboles de decisión correspondientes
+    set.seed(100)
+    randomTrees <- train(diagnosis ~ ., 
+                              data=trainRandomTree, 
+                              method="rpart2", 
+                              trControl = trainControl(method = "repeatedcv", 
+                                                       number = 10,
+                                                       repeats = 3,
+                                                       classProbs = TRUE,
+                                                       savePredictions="final",
+                                                       summaryFunction = multiClassSummary),
+                              tuneGrid = treeGrid
+    )
+
+    # guardamos la precisión del modelo
+    accuracyTree <- max(randomTrees$results$Accuracy)
+    
+    # si la exactitud es superior a la del mejor modelo hasta ahora, 
+    ## acualizamos mejor modelo y mejor precisión
+    if(accuracyTree > bestAccuracyTree) {
+     bestTree <- randomTrees
+     bestAccuracyTree <- accuracyTree
+     print(bestAccuracyTree)
+    }
+    
+  }
+}
+
+# para medir tiempo de ejecución del script
+timeRandomTree <- Sys.time() - timeRandomTree
+timeRandomTree <- as.numeric(timeRandomTree, units="secs")
+
+bestRandomTree <- bestTree
+
+bestAccuracyTree
+```
+
+```{r fig.width=5, fig.height=4}
+rpart.plot::rpart.plot(bestRandomTree$finalModel)
+```
+
+## Bagging (Random Forest)
+
+```{r}
+rf1 <- train(x = data[-1] %>% select(-all_of(notSignificantVariables)),
+             y = data$diagnosis,
+             ntree = 5, # number of trees (passed ot random forest)
+             method = "rf") # random forests
+
+
+ggplot(rf1)
+```
+
+```{r}
+# Vamos a evaluar todas las combinaciones de parámetros utilizando validación cruzada
+controlRF <- trainControl(method='repeatedcv',
+                          number=10,
+                          repeats = 3,
+                          savePredictions = "final",
+                          summaryFunction = multiClassSummary)
+
+# Creamos una función customizada para ajustar modelos random forest
+customRF <- list(type = "Classification",
+                 library = "randomForest",
+                 loop = NULL)
+
+# Vamos a controlar los siguientes parámetros:
+# el número de variables seleccionado al azar en cada corte
+# el número de árboles de decisión que se van a ajustar
+# el tamaño de nodo mínimo
+customRF$parameters <- data.frame(parameter = c("mtry", "ntree", "nodesize"),
+                                  class = rep("numeric", 3),
+                                  label = c("mtry", "ntree", "nodesize"))
+
+customRF$grid <- function(x, y, len = NULL, search = "grid") {}
+
+# definimos la función a utilizar por el paquete caret cuando ejecutemos el
+# comando train()
+customRF$fit <- function(x, y, wts, param, lev, last, weights, classProbs) {
+  randomForest(x, y,
+               mtry = param$mtry,
+               ntree=param$ntree,
+               nodesize=param$nodesize)
+}
+
+customRF$predict <- function(modelFit, newdata, preProc = NULL, submodels = NULL) {
+  predict(modelFit, newdata)
+}
+customRF$prob <- function(modelFit, newdata, preProc = NULL, submodels = NULL)
+  NULL
+```
+
+```{r cache=TRUE}
+# creamos un grid con los valores a probar de los distintos hiperparámetros
+gridRF = expand.grid(mtry = c(1:5), 
+                     ntree = c(100,500),
+                     nodesize = c(2,4,6,8))
+
+# ejecutamos el modelo
+set.seed(100)
+customRF1 <- train(x = data[-1] %>% select(-all_of(notSignificantVariables)),
+                   y = data$diagnosis,
+                   method=customRF, 
+                   metric="Accuracy", 
+                   tuneGrid=gridRF, 
+                   trControl=controlRF)
+
+ggplot(customRF1)
+```
+
+```{r cache=TRUE}
+# creamos un grid con los valores a probar de los distintos hiperparámetros
+gridRF = expand.grid(mtry = c(1:8), 
+                     ntree = c(100,500),
+                     nodesize = c(2,4,6,8))
+
+# Eliminamos variables correlacionadas al 90% o más
+set.seed(100)
+customRF2 <- train(x = data[-1] %>% select(-c(redundantCols90, 
+                                              notSignificantVariables)),
+                   y = data$diagnosis,
+                   method=customRF, 
+                   metric="Accuracy", 
+                   tuneGrid=gridRF, 
+                   trControl=controlRF)
+
+ggplot(customRF2)
+```
+
+```{r cache=TRUE, fig.width=9, fig.height=5}
+# # creamos un grid con los valores a probar de los distintos hiperparámetros
+# gridRF = expand.grid(mtry = c(4:10), 
+#                      ntree = c(100,500),
+#                      nodesize = c(2,4,6,8))
+# 
+# # Eliminamos variables correlacionadas al 95% o más
+# set.seed(100)
+# customRF3 <- train(x = data[-1] %>% select(-c(redundantCols95, 
+#                                               notSignificantVariables)),
+#                    y = data$diagnosis,
+#                    method=customRF, 
+#                    metric="Accuracy", 
+#                    tuneGrid=gridRF, 
+#                    trControl=controlRF)
+
+ggplot(customRF3) +
+  facet_wrap( ~ ntree, labeller = label_both) +
+  labs(x = "Covariables seleccionadas al azar",
+       y = "Exactitud") +
+  guides(colour=guide_legend(title="Tamaño mínimo de nodo   "),
+         shape = guide_legend(title="Tamaño mínimo de nodo   ")) +
+  theme(legend.position = "bottom")
+```
+
+```{r cache=TRUE}
+# creamos un grid con los valores a probar de los distintos hiperparámetros
+gridRF = expand.grid(mtry = c(1:4), 
+                     ntree = c(100,500),
+                     nodesize = c(2,4,6,8))
+
+# Seleccionamos únicamente variables con una importancia elevada en la PCA
+set.seed(100)
+customRF4 <- train(x = data[names(data) %in% variablesPCA],
+                   y = data$diagnosis,
+                   method=customRF, 
+                   metric="Accuracy", 
+                   tuneGrid=gridRF, 
+                   trControl=controlRF)
+
+ggplot(customRF4)
+```
+
+```{r}
+customRF3$finalModel$importance %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  arrange(MeanDecreaseGini) %>%
+  mutate(rowname = factor(rowname, levels = rowname)) %>%
+  ggplot(aes(x = MeanDecreaseGini, y = rowname)) + 
+  geom_col() +
+  labs(x = "importancia",
+       y = "variable")
+```
+
+
+## Boosting (gradien boosting, gbm)
+
+```{r cache=TRUE}
+# Boosting trees
+gbmGrid =  expand.grid(interaction.depth = 1:3,
+                       n.trees = (2:4) * 500,
+                       shrinkage = c(0.1, 0.2, 0.3),
+                       n.minobsinnode = c(5,10))
+
+set.seed(100)
+gbmCustom = train(diagnosis ~ ., data = data %>% 
+                    select(-all_of(notSignificantVariables)),
+                  method = "gbm",
+                  trControl = trainControl(method = "repeatedcv",
+                                           number = 10, repeats = 3,
+                                           savePredictions="final",
+                                           summaryFunction = multiClassSummary),
+                  verbose = FALSE,
+                  tuneGrid = gbmGrid)
+ggplot(gbmCustom)
+```
+
+```{r cache=TRUE, fig.width=9, fig.height=5}
+# Boosting trees
+gbmGrid =  expand.grid(interaction.depth = 1:3,
+                       n.trees = (2:4) * 500,
+                       shrinkage = c(0.1, 0.2, 0.3),
+                       n.minobsinnode = c(5,10))
+
+set.seed(100)
+# Eliminamos variables correlacionadas al 95% o más
+gbmCustom95 = train(diagnosis ~ ., data = data %>% select(-c(redundantCols95,
+                                                             notSignificantVariables)),
+                    method = "gbm",
+                    trControl = trainControl(method = "repeatedcv",
+                                             number = 10, repeats = 3,
+                                             savePredictions="final",
+                                             summaryFunction = multiClassSummary),
+                    verbose = FALSE,
+                    tuneGrid = gbmGrid)
+
+ggplot(gbmCustom95) +
+  facet_grid(n.minobsinnode ~ shrinkage, labeller = label_both) +
+  labs(x = "nº de iteraciones/árboles",
+       y = "Exactitud") + 
+  guides(colour=guide_legend(title="Profundidad máxima   "),
+         shape = guide_legend(title="Profundidad máxima   ")) + 
+  theme(legend.position = "bottom")
+```
+
+```{r cache=TRUE}
+# Boosting trees
+gbmGrid =  expand.grid(interaction.depth = 1:3,
+                       n.trees = (2:4) * 500,
+                       shrinkage = c(0.1, 0.2, 0.3),
+                       n.minobsinnode = c(5,10))
+
+set.seed(100)
+# Eliminamos variables correlacionadas al 90% o más
+gbmCustom90 = train(diagnosis ~ ., data = data %>% select(-c(redundantCols90,
+                                                             notSignificantVariables)),
+                    method = "gbm",
+                    trControl = trainControl(method = "repeatedcv", 
+                                             number = 10, repeats = 3,
+                                             savePredictions="final",
+                                             summaryFunction = multiClassSummary),
+                    verbose = FALSE,
+                    tuneGrid = gbmGrid)
+ggplot(gbmCustom90)
+```
+
+```{r cache=TRUE}
+# Boosting trees
+gbmGrid =  expand.grid(interaction.depth = 1:3,
+                       n.trees = (2:4) * 500,
+                       shrinkage = c(0.1, 0.2, 0.3),
+                       n.minobsinnode = c(5,10))
+
+set.seed(100)
+# Eliminamos variables correlacionadas al 90% o más
+gbmCustomImportance = train(diagnosis ~ .,
+                            data = data[names(data) %in% c("diagnosis", variablesPCA)],
+                            method = "gbm",
+                            trControl = trainControl(method = "repeatedcv",
+                                                     number = 10, repeats = 3,
+                                                     savePredictions="final",
+                                                     summaryFunction = multiClassSummary),
+                            verbose = FALSE,
+                            tuneGrid = gbmGrid)
+ggplot(gbmCustomImportance)
+```
+
+```{r}
+varImp(gbmCustom95)[[1]] %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  arrange(Overall) %>%
+  mutate(rowname = factor(rowname, levels = rowname)) %>%
+  ggplot(aes(x = Overall, y = rowname)) + 
+  geom_col() +
+  labs(x = "importancia",
+       y = "variable")
+```
+
+# Máquinas de vector soporte
+
+```{r cache=TRUE}
+# Ajustamos una SVM lineal con un grid de valores para el parámetro de complejidad
+set.seed(100)
+linearSVM <- train(diagnosis ~., 
+                   data = data %>% select(-all_of(notSignificantVariables)), 
+                   method = "svmLinear", 
+                   trControl = trainControl(method = "repeatedcv", 
+                                            number = 10, repeats = 3,
+                                            savePredictions="final",
+                                            summaryFunction = multiClassSummary),
+                   preProcess = c("center","scale"), 
+                   tuneGrid = expand.grid(C = seq(0.01, 2, length = 100))
+)
+```
+
+```{r cache=TRUE}
+# Probamos con valores más cercanos al óptimo
+set.seed(100)
+linearSVM2 <- train(diagnosis ~., 
+                    data = data %>% select(-all_of(notSignificantVariables)), 
+                    method = "svmLinear", 
+                    trControl = trainControl(method = "repeatedcv",
+                                             number = 10, repeats = 3,
+                                             savePredictions="final",
+                                             summaryFunction = multiClassSummary),
+                    preProcess = c("center","scale"), 
+                    tuneGrid = expand.grid(C = seq(0.27, 0.3, length = 100))
+)
+linearSVM2$results[as.integer(rownames(linearSVM2$results)) == as.integer(rownames(linearSVM2$bestTune)),]
+```
+
+
+```{r cache=TRUE}
+# Eliminamos variables correlacionadas al 95% o más
+set.seed(100)
+linearSVM95 <- train(diagnosis ~., 
+                     data = data %>% select(-any_of(unique(c(redundantCols95, notSignificantVariables)))), 
+                     method = "svmLinear", 
+                     trControl = trainControl(method = "repeatedcv",
+                                              number = 10, repeats = 3,
+                                              savePredictions="final",
+                                              summaryFunction = multiClassSummary),
+                     preProcess = c("center","scale"), 
+                     tuneGrid = expand.grid(C = seq(1.1, 1.2, length = 100))
+)
+```
+
+```{r cache=TRUE}
+# Eliminamos variables correlacionadas al 90% o más
+set.seed(100)
+linearSVM90 <- train(diagnosis ~., 
+                     data = data %>% select(-any_of(unique(c(redundantCols90, notSignificantVariables)))), 
+                     method = "svmLinear", 
+                     trControl = trainControl(method = "repeatedcv", 
+                                              number = 10, repeats = 3,
+                                              savePredictions="final",
+                                              summaryFunction = multiClassSummary),
+                     preProcess = c("center","scale"), 
+                     tuneGrid = expand.grid(C = seq(0.2, 0.3, length = 100))
+)
+```
+
+```{r cache=TRUE}
+# Ajustamos SVM polinómica
+set.seed(100)
+polySVM <- train(diagnosis ~., 
+                 data = data %>% select(-all_of(notSignificantVariables)), 
+                 method = "svmPoly", 
+                 trControl = trainControl(method = "repeatedcv",
+                                          number = 10, repeats = 3,
+                                          savePredictions="final",
+                                          summaryFunction = multiClassSummary),
+                 preProcess = c("center","scale"), 
+                 tuneGrid = expand.grid(C = seq(0.4, 5, length = 10),
+                                        scale = seq(0.001, 1, length = 10),
+                                        degree = 1:5)
+)
+polySVM$results[as.integer(rownames(polySVM$results)) == as.integer(rownames(polySVM$bestTune)),]
+```
+
+```{r}
+# Eliminamos variables correlacionadas al 90% o más
+set.seed(100)
+polySVM90 <- train(diagnosis ~., 
+                 data = data %>% select(-any_of(unique(c(redundantCols90,
+                                                         notSignificantVariables)))), 
+                 method = "svmPoly", 
+                 trControl = trainControl(method = "repeatedcv",
+                                          number = 10, repeats = 3,
+                                          savePredictions="final",
+                                          summaryFunction = multiClassSummary),
+                 preProcess = c("center","scale"), 
+                 tuneGrid = expand.grid(C = seq(0.01, 2, length = 10),
+                                        scale = seq(0.001, 1, length = 10),
+                                        degree = 1:5)
+)
+```
+
+```{r}
+# Eliminamos variables correlacionadas al 95% o más
+set.seed(100)
+polySVM95 <- train(diagnosis ~., 
+                 data = data %>% select(-any_of(unique(c(redundantCols95,
+                                                         notSignificantVariables)))), 
+                 method = "svmPoly", 
+                 trControl = trainControl(method = "repeatedcv",
+                                          number = 10, repeats = 3,
+                                          savePredictions="final",
+                                          summaryFunction = multiClassSummary),
+                 preProcess = c("center","scale"), 
+                 tuneGrid = expand.grid(C = seq(0.01, 2, length = 10),
+                                        scale = seq(0.001, 1, length = 10),
+                                        degree = 1:5)
+)
+```
+
+
+```{r cache=TRUE}
+# Ajustamos SVM radial
+set.seed(100)
+radialSVM <- train(diagnosis ~., 
+                   data = data %>% select(-all_of(notSignificantVariables)), 
+                   method = "svmRadial", 
+                   trControl = trainControl(method = "repeatedcv", number = 10, repeats = 3,
+                                            savePredictions="final",
+                                            summaryFunction = multiClassSummary),
+                   preProcess = c("center","scale"), 
+                   tuneGrid = expand.grid(C = seq(0.01, 10, length = 10),
+                                          sigma = seq(0.005, 0.02, length = 10))
+)
+radialSVM$results[as.integer(rownames(radialSVM$results)) == as.integer(rownames(radialSVM$bestTune)),]
+```
+
+```{r cache=TRUE}
+# Ajustamos SVM radial
+set.seed(100)
+radialSVM90 <- train(diagnosis ~., 
+                   data = data %>% select(-all_of(c(notSignificantVariables, redundantCols90))), 
+                   method = "svmRadial", 
+                   trControl = trainControl(method = "repeatedcv", number = 10, repeats = 3,
+                                            savePredictions="final",
+                                            summaryFunction = multiClassSummary),
+                   preProcess = c("center","scale"), 
+                   tuneGrid = expand.grid(C = seq(0.01, 10, length = 10),
+                                          sigma = seq(0.01, 0.03, length = 10))
+)
+radialSVM90$results[as.integer(rownames(radialSVM90$results)) == as.integer(rownames(radialSVM90$bestTune)),]
+```
+
+
+```{r cache=TRUE}
+# Ajustamos SVM radial
+set.seed(100)
+radialSVM95 <- train(diagnosis ~., 
+                   data = data %>% select(-all_of(c(notSignificantVariables, redundantCols95))), 
+                   method = "svmRadial", 
+                   trControl = trainControl(method = "repeatedcv", number = 10, repeats = 3,
+                                            savePredictions="final",
+                                            summaryFunction = multiClassSummary),
+                   preProcess = c("center","scale"), 
+                   tuneGrid = expand.grid(C = seq(0.01, 10, length = 10),
+                                          sigma = seq(0.01, 0.03, length = 10))
+)
+radialSVM95$results[as.integer(rownames(radialSVM95$results)) == as.integer(rownames(radialSVM95$bestTune)),]
+```
+
+
+## Con las variables del artículo
+
+```{r}
+dataArticle <- data %>%
+  select(diagnosis, area_worst, smoothness_worst, texture_mean)
+
+glimpse(dataArticle)
+```
+
+```{r}
+set.seed(100)
+svmArticle <- train(diagnosis ~ ., 
+                              data=dataArticle, 
+                              method="svmLinear", 
+                              trControl = trainControl(method = "repeatedcv", 
+                                                       number = 10,
+                                                       repeats = 3,
+                                                       classProbs = TRUE,
+                                                       savePredictions="final",
+                                                       summaryFunction = multiClassSummary),
+                   preProcess = c("center","scale"), 
+                   tuneGrid = expand.grid(C = seq(0.3, 5, length = 100))
+)
+svmArticle$results[as.integer(rownames(svmArticle$results)) == as.integer(rownames(svmArticle$bestTune)),]
+```
+
+```{r}
+set.seed(100)
+svmPolyArticle <- train(diagnosis ~ ., 
+                              data=dataArticle, 
+                              method="svmPoly", 
+                              trControl = trainControl(method = "repeatedcv", 
+                                                       number = 10,
+                                                       repeats = 3,
+                                                       classProbs = TRUE,
+                                                       savePredictions="final",
+                                                       summaryFunction = multiClassSummary),
+                 preProcess = c("center","scale"), 
+                 tuneGrid = expand.grid(C = seq(0.01, 2, length = 10),
+                                        scale = seq(0.001, 1, length = 10),
+                                        degree = 1:5))
+
+svmPolyArticle$results[as.integer(rownames(svmPolyArticle$results)) == as.integer(rownames(svmPolyArticle$bestTune)),]
+```
+
+```{r}
+set.seed(100)
+svmRadialArticle <- train(diagnosis ~ ., 
+                              data=dataArticle, 
+                              method="svmRadial", 
+                              trControl = trainControl(method = "repeatedcv", 
+                                                       number = 10,
+                                                       repeats = 3,
+                                                       classProbs = TRUE,
+                                                       savePredictions="final",
+                                                       summaryFunction = multiClassSummary),
+                   preProcess = c("center","scale"), 
+                   tuneGrid = expand.grid(C = seq(0.01, 10, length = 10),
+                                          sigma = seq(0.001, 0.1, length = 10))
+                   )
+
+svmRadialArticle$results[as.integer(rownames(svmRadialArticle$results)) == as.integer(rownames(svmRadialArticle$bestTune)),]
+```
+
+
+# Lista con todos los modelos ajustados
+
+```{r}
+allModels <- list(
+  # regresión logística
+  "logisticFull" = logisticFull2,
+  "logisticPCA" = modelsPCA[[9]],
+  "logisticCorr90" = logisticCorr90,
+  "logisticCorr95" = logisticCorr95,
+  "logisticImportance" = logisticImportance,
+  "logisticForward" = logisticForward,
+  "logisticBackward" = logisticBackward,
+  "logisticAccuracyForward" = logisticAccuracyForward,
+  "logisticAccuracyBackward" = logisticAccuracyBackward,
+  "logisticRidge" = ridgeFit,
+  "logisticRidge90" = ridgeFit90,
+  "logisticRidge95" = ridgeFit95,
+  "logisticLasso" = lassoFit,
+  "logisticLasso90" = lassoFit90,
+  "logisticLasso95" = lassoFit95,
+  "logisticElnet" = elnetFit,
+  "logisticElnet90" = elnetFit90,
+  "logisticElnet95" = elnetFit95,
+  # LDA
+  "ldaFull" = lda1,
+  "ldaPCA" = ldaPCA[[19]],
+  "lda90" = lda90,
+  "lda95" = lda95,
+  "ldaImportance" = ldaImportance,
+  "ldaAccuracyForward" = ldaAccuracyForward,
+  "ldaAccuracyBackward" = ldaAccuracyBackward,
+  # KNN
+  "knn" = knn1,
+  "knn90" = knn2,
+  "knn95" =  knn3,
+  "knnManhattan" = kknn1,
+  "knnManhattan90" = kknn2,
+  "knnManhattan95" = kknn3,
+  # Árboles de decisión
+  "decisionTree" = decisionTree,
+  "decisionTreeCp" = decisionTreeCp,
+  "decisionTreeMaxDepth" = decisionTreeMaxDepth,
+  "decisionTreeMaxDepthCorr90" = decisionTreeMaxDepthCorr90,
+  "decisionTreeMaxDepthCorr95" = decisionTreeMaxDepthCorr95,
+  "randomTreesBest" = bestRandomTree,
+  # Random Forest
+  "customRF" = customRF1,
+  "customRF90" = customRF2,
+  "customRF95" = customRF3,
+  "customRFImportance" = customRF4,
+  # Boosting
+  "gbmCustom" = gbmCustom,
+  "gbmCustom90" = gbmCustom90,
+  "gbmCustom95" = gbmCustom95,
+  "gbmCustomImportance" = gbmCustomImportance,
+  # SVM
+  "linearSVM" = linearSVM2,
+  "linearSVM95" = linearSVM95,
+  "linearSVM90" = linearSVM90,
+  "polySVM" = polySVM,
+  "polySVM95" = polySVM95,
+  "polySVM90" = polySVM90,
+  "radialSVM" = radialSVM,
+  "radialSVM90" = radialSVM90,
+  "radialSVM95" = radialSVM95,
+  "svmLinealArticle" = svmArticle,
+  "svmPolyArticle" = svmPolyArticle,
+  "svmRadialArticle" = svmRadialArticle
+)
+```
+
+```{r}
+# Generar tabla con todas las métricas de evaluación y los tiempos de ejecución
+metricsList <- lapply(allModels, function(x){
+  
+  # sacamos la exactitud, sensibilidad, especificidad y tiempo de ejecución
+  cbind(
+    x$results[as.integer(rownames(x$results)) == as.integer(rownames(x$bestTune)),
+              c("Accuracy", "Sensitivity", "Specificity")] %>% round(5),
+    tibble(time = x$times$everything[3] %>% unname() %>% round(2))
+  )
+  
+
+}) %>%
+  bind_rows() # convertimos la lista en dataframe
+
+# añadimos los nombres de los modelos
+metricsList <- cbind(tibble(model = names(allModels)), metricsList)
+
+# Corregimos los tiempos de ejecución de todos los scripts programados a mano
+stepwiseAccuracyTimes <- unname(
+  c(timeLogisticAccuracyForward, timeLogisticAccuracyBackward, 
+    timeLdaAccuracyForward, timeLdaAccuracyBackward)
+) 
+metricsList[grepl("Accuracy", metricsList$model),]$time <- stepwiseAccuracyTimes %>% round(2)
+metricsList[metricsList$model == "logisticPCA",]$time <- timeLogisticPCA %>% round(2)
+metricsList[metricsList$model == "ldaPCA",]$time <- timeLdaPCA %>% round(2)
+metricsList[metricsList$model == "randomTreesBest",]$time <- timeRandomTree %>% round(2)
+
+# Por orden de ejecución
+print(metricsList)
+```
+
+```{r}
+# Por orden de exactitud, de mayor a menor
+print(metricsList %>% arrange(desc(Accuracy)))
+```
+
+# Límite de decisión de todos los modelos sobre las dos primeras componentes principales
+
+```{r}
+# Experimento revertir PCA
+Z <- data[-1]
+
+Zpca <- princomp(Z, cor = TRUE, scores = TRUE)
+
+nComp <- 2
+Zhat <- t(t(Zpca$scores[,1:nComp] %*% t(Zpca$loadings)[1:nComp,]) * Zpca$scale + Zpca$center)
+
+#-----------------------------------------------------------------------------
+# Ahora generamos una rejilla con valores de las primeras dos componentes principales
+gridPCA <- expand.grid(Comp1 = seq(-8,17, length = 150),
+            Comp2 = seq(-14,9, length = 100))
+
+# y transformamos esa rejilla a las variables originales
+gridPCAPredictors <- t(t(as.matrix(gridPCA) %*% 
+                           t(PCA$loadings)[1:nComp,]) * PCA$scale + PCA$center) %>%
+  as_tibble()
+
+# predecimos con nuestro modelo sobre los datos generados
+predictions <- predict(knn1, newdata = gridPCAPredictors) %>%
+  relevel(., ref = "M")
+
+# y representamos esas predicciones sobre las primeras dos componentes principales
+ggplot() +
+  geom_point(data = cbind(gridPCA, predictions), 
+             aes(x = Comp1, y = Comp2, colour = predictions), size = 0.5) +
+  geom_point(data = dataPCA, aes(x=Comp.1,y=Comp.2, fill=diagnosis),
+             colour = "black", size = 1.5, pch = 21, stroke = 0.5) +
+  scale_colour_manual(name = "diagnóstico",
+                      labels = c("maligno", "benigno"),
+                      values = c("#9E67AB" , "#E69F00"))+
+  scale_fill_manual(name = "diagnóstico",
+                    labels = c("maligno", "benigno"),
+                    values = c("#9E67AB" , "#E69F00"))+
+  theme(plot.title = element_text(size = 12, face = "bold"),
+        legend.title=element_text(size=10), 
+        legend.text=element_text(size=8),
+        axis.title = element_text(size = 10)) +
+  guides(colour = guide_legend(override.aes = list(size=2))) +
+  ggtitle("knn1")
+```
+
+```{r}
+# Guardamos las predicciones sobre el grid de todos los modelos ajustados
+predictionsPerModel <- vector(mode = "list", length = length(allModels))
+
+for (i in seq_along(allModels)) {
+  
+  # print(names(allModels[i])) # para testing
+  
+  if (names(allModels[i]) %in% c("logisticPCA", "ldaPCA")) {
+    
+    predictionsPerModel[[i]] <- NULL
+    
+  } else {
+    predictionsPerModel[[i]] <- predict(allModels[[i]], newdata = gridPCAPredictors)
+  }
+}
+```
+
+```{r}
+# representamos los límites de decisión de todos los modelos ajustados
+# sobre las primeras dos componentes principales
+plotDecisionBoundaries <- vector(mode = "list", length = length(allModels))
+
+for (i in seq_along(allModels)) {
+  
+  if (names(allModels[i]) %in% c("logisticPCA", "ldaPCA")) {
+    
+    plotDecisionBoundaries[[i]] <- NULL
+    
+  } else {
+  
+  plotDecisionBoundaries[[i]] <- ggplot() +
+  geom_point(data = cbind(gridPCA, tibble(predictions = predictionsPerModel[[i]])),
+             aes(x = Comp1, y = Comp2, colour = predictions), size = 0.5) +
+  geom_point(data = dataPCA, aes(x=Comp.1,y=Comp.2, fill=diagnosis),
+             colour = "black", size = 2, pch = 21, stroke = 0.3) +
+  scale_colour_manual(name = "diagnóstico",
+                      labels = c("maligno", "benigno"),
+                      values = c("#9E67AB" , "#E69F00"))+
+    scale_fill_manual(name = "diagnóstico",
+                      labels = c("maligno", "benigno"),
+                      values = c("#9E67AB" , "#E69F00"))+
+  theme(plot.title = element_text(size = 12, face = "bold"),
+        legend.title=element_text(size=9), 
+        legend.text=element_text(size=8),
+        axis.title = element_text(size = 10)) +
+  guides(colour = guide_legend(override.aes = list(size=2))) +
+  ggtitle(names(allModels[i]))+ 
+    scale_x_continuous(breaks=seq(-5,15,5)) +
+    scale_y_continuous(breaks=seq(-15,10,5))
+  }
+}
+
+plotDecisionBoundaries
+```
+
